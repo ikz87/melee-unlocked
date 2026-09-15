@@ -147,7 +147,7 @@ uint32_t gcadapter_poll(PadState out[4]) {
     std::memset(&p, 0, sizeof p);
     p.err = 0;
     uint16_t b = 0;
-    if (c[1] & 0x01) b |= PAD_A; if (c[1] & 0x02) b |= PAD_B; if (c[1] & 0x04) b |= PAD_X; if (c[1] & 0x08) b |= PAD_Y;
+    if (c[1] & 0x01) b |= PAD_A; if (c[1] & 0x02) b |= PAD_X; if (c[1] & 0x04) b |= PAD_B; if (c[1] & 0x08) b |= PAD_Y;
     if (c[1] & 0x10) b |= PAD_LEFT; if (c[1] & 0x20) b |= PAD_RIGHT; if (c[1] & 0x40) b |= PAD_DOWN; if (c[1] & 0x80) b |= PAD_UP;
     if (c[2] & 0x01) b |= PAD_START; if (c[2] & 0x02) b |= PAD_Z; if (c[2] & 0x04) b |= PAD_R; if (c[2] & 0x08) b |= PAD_L;
     p.button = b;
