@@ -1,7 +1,12 @@
 // Native Melee port entry point.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #define NOMINMAX
+#ifdef _MSC_VER
 #include <windows.h>
+#else
+#include <unistd.h>
+#endif
+#include <csignal>
 #include "host.h"
 #include "gecko_data.h"
 #include "slippi_playback.h"
@@ -14,13 +19,17 @@
 #include "guest_symbols.h"
 #include "gx_core.h"
 #include "gx_d3d12.h"
+#include "gx_gl.h"
 #include "pc_settings.h"
 #include "threaded_backend.h"
 #include "window.h"
 #include "updater.h"
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <memory>
 #include <string>
 
 namespace ppc { void init_dispatch(); }
@@ -41,8 +50,10 @@ static void usage() {
 // retrace, the presentation deadline, the audio device wait) overshoots by up to a frame. One
 // millisecond is what games ask for, and it is what makes 60 Hz land on 60 Hz.
 struct TimerResolution {
+#ifdef _MSC_VER
   bool raised = timeBeginPeriod(1) == TIMERR_NOERROR;
   ~TimerResolution() { if (raised) timeEndPeriod(1); }
+#endif
 };
 
 #ifndef MELEE_PORT_VERSION
@@ -53,6 +64,7 @@ struct TimerResolution {
 // started (a batch file, a shortcut, the launcher, a development command line), the launcher can
 // then offer that disc instead of leaving Play greyed out with an empty box.
 static void remember_iso(const std::string& iso) {
+#ifdef _MSC_VER
   char full[MAX_PATH];
   if (!GetFullPathNameA(iso.c_str(), MAX_PATH, full, nullptr)) return;
   char* local = nullptr; size_t n = 0;
@@ -64,13 +76,33 @@ static void remember_iso(const std::string& iso) {
   if (!f) return;
   std::fprintf(f, "iso=%s\n", full);
   std::fclose(f);
+#else
+  // Linux has no launcher; remember the disc next to the settings file instead.
+  const char* home = getenv("HOME");
+  if (!home) return;
+  std::string dir = std::string(home) + "/.config/MeleeUnlocked";
+  std::error_code ec;
+  std::filesystem::create_directories(dir, ec);
+  FILE* f = std::fopen((dir + "/launcher.ini").c_str(), "w");
+  if (!f) return;
+  std::fprintf(f, "iso=%s\n", iso.c_str());
+  std::fclose(f);
+#endif
 }
 
 int main(int argc, char** argv) {
   for (int i = 1; i < argc; ++i)
     if (std::string(argv[i]) == "--version") { std::printf("%s\n", MELEE_PORT_VERSION); return 0; }
+#ifndef _MSC_VER
+  // Ctrl+C / kill should unwind so the GC adapter and other device handles are released.
+  std::signal(SIGINT, [](int) { host::request_exit(0); });
+  std::signal(SIGTERM, [](int) { host::request_exit(0); });
+#endif
   TimerResolution timer_resolution;
   host::Options& o = host::options;
+#ifndef _MSC_VER
+  o.volume = 70;   // Linux has no in-game settings overlay, so don't start muted
+#endif
   bool headless = false, hidden = false, threaded = false, fps_requested = false;
   gx::D3D12Options gfx;
   bool automated = false, explicit_frame_mode = false;
@@ -175,15 +207,26 @@ int main(int argc, char** argv) {
   remember_iso(o.iso);   // so the launcher can offer this disc without being told again
 
   std::unique_ptr<gx::Backend> backend;
+#ifdef _MSC_VER
   if (!headless && threaded) {
     backend = gx::create_threaded_backend(gfx, !hidden);
   } else if (!headless) {
-    void* hwnd = host::window_create(gfx.window_w, gfx.window_h, L"Melee Unlocked (development)", !hidden);
+    void* hwnd = host::window_create(gfx.window_w, gfx.window_h, "Melee Unlocked (development)", !hidden);
     if (gfx.fullscreen) host::window_set_fullscreen(true);
     backend.reset(gx::create_d3d12_backend(hwnd, gfx.window_w, gfx.window_h, gfx));
     host::window_set_resize_callback([renderer = backend.get()](int w, int h) { gx::d3d12_resize(renderer, w, h); });
     host::g_has_window = true;
   }
+#else
+  (void)threaded;
+  if (!headless) {
+    void* window = host::window_create(gfx.window_w, gfx.window_h, "Melee Unlocked (development)", !hidden);
+    if (gfx.fullscreen) host::window_set_fullscreen(true);
+    backend.reset(gx::create_gl_backend(window, gfx.window_w, gfx.window_h, gfx));
+    host::window_set_resize_callback([renderer = backend.get()](int w, int h) { gx::gl_resize(renderer, w, h); });
+    host::g_has_window = true;
+  }
+#endif
   gx::set_authored_capture(gfx.subframe == gx::SubFrameMode::Authored || gfx.subframe == gx::SubFrameMode::AuthoredInterpolate);
   gx::init(backend.get());
   host::audio_open(o.volume, o.audio_dump.c_str(), !headless);
@@ -214,5 +257,12 @@ int main(int argc, char** argv) {
     if (calls) host::log("interpreter: %llu calls into RAM-resident code, %llu instructions", (unsigned long long)calls, (unsigned long long)insns); }
   host::log("slippi: %llu EXI commands, %llu replays written, GCT at %08X", (unsigned long long)slippi::commands_seen(),
             (unsigned long long)slippi::replays_written(), slippi::gct_load_address());
+#ifndef _MSC_VER
+  // Mesa/Wayland and some audio drivers can block in their atexit/static teardown after a windowed
+  // GL session. All host resources are closed above, so leave the process directly.
+  host::window_destroy();
+  std::fflush(nullptr);
+  _exit(code);
+#endif
   return code;
 }

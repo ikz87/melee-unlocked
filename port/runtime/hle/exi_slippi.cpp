@@ -6,8 +6,7 @@
 #include "gecko_data.h"
 #include "host.h"
 #include "vcdiff.h"
-#define NOMINMAX
-#include <windows.h>
+#include "compat.h"
 #include <cstdio>
 #include <atomic>
 #include <cstring>
@@ -111,7 +110,7 @@ void create_file() {
   CreateDirectoryA(g_replay_dir.c_str(), nullptr);
   char stamp[32];
   std::strftime(stamp, sizeof stamp, "%Y%m%dT%H%M%S", std::localtime(&g_start_time));
-  g_replay_path = g_replay_dir + "\\Game_" + stamp + ".slp";
+  g_replay_path = g_replay_dir + "/Game_" + stamp + ".slp";
   g_file = std::fopen(g_replay_path.c_str(), "wb");
   if (!g_file) { host::log("slippi: cannot create %s", g_replay_path.c_str()); return; }
   const uint8_t header[] = {'{', 'U', 3, 'r', 'a', 'w', '[', '$', 'U', '#', 'l', 0, 0, 0, 0};

@@ -4,9 +4,15 @@
 #include "slippi_net.h"
 #include "host.h"
 #define NOMINMAX
+#ifdef _MSC_VER
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#else
+#include <arpa/inet.h>
+#include <cerrno>
+#include <iconv.h>
+#endif
 #include <enet/enet.h>
 #include <nlohmann/json.hpp>
 #include <algorithm>
@@ -28,6 +34,7 @@ uint64_t time_us() { return (uint64_t)std::chrono::duration_cast<std::chrono::mi
 uint64_t time_ms() { return time_us() / 1000; }
 
 // ---------------------------------------------------------------- strings
+#ifdef _MSC_VER
 static std::wstring utf8_to_wide(const std::string& s) {
   if (s.empty()) return {};
   int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
@@ -50,6 +57,36 @@ std::string shiftjis_to_utf8(const std::string& s) {
   MultiByteToWideChar(932, 0, s.data(), (int)s.size(), &w[0], n);
   return wide_to_cp(w, CP_UTF8);
 }
+#else
+// POSIX/glibc: convert through iconv (CP932 is the Slippi tag encoding).
+static std::string iconv_convert(const char* from, const char* to, const std::string& in) {
+  if (in.empty()) return {};
+  iconv_t cd = iconv_open(to, from);
+  if (cd == (iconv_t)-1) return in;
+  std::string out(in.size() * 4 + 16, '\0');
+  char* inbuf = const_cast<char*>(in.data());
+  size_t inleft = in.size();
+  char* outbuf = &out[0];
+  size_t outleft = out.size();
+  while (inleft > 0) {
+    if (iconv(cd, &inbuf, &inleft, &outbuf, &outleft) != (size_t)-1) break;
+    if (errno == E2BIG) {
+      size_t used = out.size() - outleft;
+      out.resize(out.size() * 2);
+      outbuf = &out[used];
+      outleft = out.size() - used;
+      continue;
+    }
+    break;  // EILSEQ/EINVAL: leave the remainder as-is
+  }
+  size_t used = out.size() - outleft;
+  iconv_close(cd);
+  out.resize(used);
+  return out;
+}
+std::string utf8_to_shiftjis(const std::string& s) { return iconv_convert("UTF-8", "CP932", s); }
+std::string shiftjis_to_utf8(const std::string& s) { return iconv_convert("CP932", "UTF-8", s); }
+#endif
 std::string truncate_length_char(const std::string& input, int length) {
   // Count code points, not bytes (UTF8ToUTF32 / resize / UTF32toUTF8 in Dolphin).
   std::string out;

@@ -1,5 +1,12 @@
 # Native Melee port: recompiled guest code + host runtime.
 cmake_minimum_required(VERSION 3.15)
+
+# POSIX hosts build through a separate source set (SDL2/OpenGL instead of Win32/D3D12).
+if(NOT WIN32)
+  include("${CMAKE_CURRENT_SOURCE_DIR}/PortLinux.cmake")
+  return()
+endif()
+
 add_executable(port_frame_queue_test tests/frame_queue_test.cpp)
 target_include_directories(port_frame_queue_test PRIVATE runtime/gx)
 target_compile_features(port_frame_queue_test PRIVATE cxx_std_17)

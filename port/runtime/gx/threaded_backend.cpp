@@ -209,7 +209,7 @@ class ThreadedBackend final : public Backend {
     worker = std::thread([this, options, visible, init = std::move(initialized)]() mutable {
       bool started = false;
       try {
-        void* window = host::window_create(options.window_w, options.window_h, L"Melee Unlocked (development)", visible);
+        void* window = host::window_create(options.window_w, options.window_h, "Melee Unlocked (development)", visible);
         if (options.fullscreen) host::window_set_fullscreen(true);
         // The swapchain must match the window as it is now (fullscreen covers the monitor, not window_w x window_h).
         int client_w = options.window_w, client_h = options.window_h;

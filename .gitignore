@@ -9,6 +9,7 @@ dependencies/
 /port/generated/
 /port/generated_playback/
 /build-review/
+/build-linux/
 /melee/
 /slippi/
 shadercache/

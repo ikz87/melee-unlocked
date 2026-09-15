@@ -2,6 +2,7 @@
 // shared mode on the default render endpoint (the device Windows and browsers use, with the
 // mixer's own resampling); WinMM waveOut is the fallback. Optional WAV dump of everything played.
 // SPDX-License-Identifier: GPL-2.0-or-later
+#ifdef _MSC_VER
 #define NOMINMAX
 #include <windows.h>
 #include <mmsystem.h>
@@ -291,3 +292,5 @@ void audio_rate_range(double* low, double* high) { if (low) *low = g_rate_min.lo
 uint32_t audio_buffered_ms() { return (uint32_t)((g_ring_write.load() - g_ring_read.load()) * 1000 / SAMPLE_RATE); }
 
 }  // namespace host
+
+#endif  // _MSC_VER

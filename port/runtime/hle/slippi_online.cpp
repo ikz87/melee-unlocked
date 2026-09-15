@@ -767,16 +767,36 @@ bool is_online_match() { return g_in_online_match; }
 static bool file_exists(const std::string& p) { FILE* f = std::fopen(p.c_str(), "rb"); if (!f) return false; std::fclose(f); return true; }
 
 void init() {
-  report::init(host::options.iso, g_config.user_dir);
   // Without a user.json in the configured folder, use the Slippi Launcher's own login so a fresh
   // install of the port shares the account the user already signed into.
   if (!file_exists(g_config.user_dir + "/user.json")) {
+#ifdef _MSC_VER
     const char* appdata = std::getenv("APPDATA");
     if (appdata) {
       std::string launcher = std::string(appdata) + "/Slippi Launcher/netplay/User/Slippi";
       if (file_exists(launcher + "/user.json")) { host::log("slippi: using the Slippi Launcher login at %s", launcher.c_str()); g_config.user_dir = launcher; }
     }
+#else
+    // Linux: the Slippi Launcher keeps the account under the XDG config dir, and Dolphin's netplay
+    // builds keep theirs under their own config dir. Take whichever has a user.json.
+    const char* xdg = std::getenv("XDG_CONFIG_HOME");
+    const char* home = std::getenv("HOME");
+    std::string cfg = (xdg && *xdg) ? xdg : (home ? std::string(home) + "/.config" : "");
+    static const char* const candidates[] = {
+      "/SlippiOnline/Slippi",                       // Slippi Launcher (Linux AppImage)
+      "/slippi-dolphin/netplay/Slippi",             // Slippi Dolphin, mainline
+      "/slippi-dolphin/netplay-beta/Slippi",        // Slippi Dolphin, beta
+      "/Slippi Launcher/netplay/User/Slippi",       // Windows-style layout, if ever
+    };
+    if (!cfg.empty()) {
+      for (const char* c : candidates) {
+        std::string launcher = cfg + c;
+        if (file_exists(launcher + "/user.json")) { host::log("slippi: using the Slippi Launcher login at %s", launcher.c_str()); g_config.user_dir = launcher; break; }
+      }
+    }
+#endif
   }
+  report::init(host::options.iso, g_config.user_dir);
   g_user = std::make_unique<User>(g_config.user_dir);
   if (g_user->IsLoggedIn()) report::fetch_user_rank(g_user->GetUserInfo().uid);
   g_matchmaking = std::make_unique<Matchmaking>(g_user.get());

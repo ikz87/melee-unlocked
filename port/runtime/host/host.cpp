@@ -2,8 +2,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "host.h"
 #include "memory_range.h"
+#include "compat.h"
+#ifdef _MSC_VER
 #include <windows.h>
 #include <bcrypt.h>
+#endif
 #include "functions.h"
 #include "guest_symbols.h"
 #include "gx_core.h"
@@ -192,6 +195,40 @@ bool disc_find_file(const std::string& name, uint32_t* offset, uint32_t* size) {
 uint32_t disc_fst_max_size() { return g_fst_max; }
 
 // ---------------- boot ----------------
+// Portable SHA-1 used to verify the DOL on every platform (Windows previously used BCrypt).
+static void sha1(const uint8_t* msg, size_t len, uint8_t out[20]) {
+  uint32_t h0 = 0x67452301, h1 = 0xEFCDAB89, h2 = 0x98BADCFE, h3 = 0x10325476, h4 = 0xC3D2E1F0;
+  auto rol = [](uint32_t x, int n) { return (x << n) | (x >> (32 - n)); };
+  std::vector<uint8_t> data(msg, msg + len);
+  uint64_t bitlen = (uint64_t)len * 8;
+  data.push_back(0x80);
+  while (data.size() % 64 != 56) data.push_back(0);
+  for (int i = 7; i >= 0; --i) data.push_back((uint8_t)(bitlen >> (i * 8)));
+  for (size_t off = 0; off < data.size(); off += 64) {
+    uint32_t w[80];
+    for (int i = 0; i < 16; ++i)
+      w[i] = ((uint32_t)data[off + i * 4] << 24) | ((uint32_t)data[off + i * 4 + 1] << 16) |
+             ((uint32_t)data[off + i * 4 + 2] << 8) | data[off + i * 4 + 3];
+    for (int i = 16; i < 80; ++i) w[i] = rol(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+    uint32_t a = h0, b = h1, c = h2, d = h3, e = h4;
+    for (int i = 0; i < 80; ++i) {
+      uint32_t f, k;
+      if (i < 20) { f = (b & c) | ((~b) & d); k = 0x5A827999; }
+      else if (i < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1; }
+      else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
+      else { f = b ^ c ^ d; k = 0xCA62C1D6; }
+      uint32_t t = rol(a, 5) + f + e + k + w[i];
+      e = d; d = c; c = rol(b, 30); b = a; a = t;
+    }
+    h0 += a; h1 += b; h2 += c; h3 += d; h4 += e;
+  }
+  uint32_t hs[5] = {h0, h1, h2, h3, h4};
+  for (int i = 0; i < 5; ++i) {
+    out[i * 4] = (uint8_t)(hs[i] >> 24); out[i * 4 + 1] = (uint8_t)(hs[i] >> 16);
+    out[i * 4 + 2] = (uint8_t)(hs[i] >> 8); out[i * 4 + 3] = (uint8_t)hs[i];
+  }
+}
+
 static void load_dol_from_disc() {
   uint8_t hdr[0x20];
   if (!disc_read(0x420, hdr, 4)) die("cannot read disc DOL offset");
@@ -199,14 +236,10 @@ static void load_dol_from_disc() {
   constexpr uint32_t dol_size = 0x4385E0u;
   std::vector<uint8_t> image(dol_size);
   if (!disc_read(dol_offset, image.data(), dol_size)) die("cannot read full Melee DOL");
-  BCRYPT_ALG_HANDLE algorithm = nullptr;
   uint8_t digest[20];
   const uint8_t expected[20] = {0x08,0xe0,0xbf,0x20,0x13,0x4d,0xfc,0xb2,0x60,0x69,0x96,0x71,0x00,0x45,0x27,0xb2,0xd6,0xbb,0x1a,0x45};
-  if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA1_ALGORITHM, nullptr, 0) < 0)
-    die("cannot initialize game-image verification");
-  NTSTATUS hash_status = BCryptHash(algorithm, nullptr, 0, image.data(), dol_size, digest, sizeof digest);
-  BCryptCloseAlgorithmProvider(algorithm, 0);
-  if (hash_status < 0 || std::memcmp(digest, expected, sizeof digest))
+  sha1(image.data(), dol_size, digest);
+  if (std::memcmp(digest, expected, sizeof digest))
     die("ISO DOL does not match vanilla Melee NTSC 1.02; recompiled code cannot run this image");
   uint8_t dh[0x100];
   if (!disc_read(dol_offset, dh, sizeof dh)) die("cannot read DOL header");

@@ -3,9 +3,19 @@
 #include "slippi_net.h"
 #include "host.h"
 #define NOMINMAX
+#ifdef _MSC_VER
 #include <windows.h>
 #include <winhttp.h>
 #include <bcrypt.h>
+#pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "bcrypt.lib")
+#else
+#include <curl/curl.h>
+#include <openssl/evp.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <ctime>
+#endif
 #include <nlohmann/json.hpp>
 #include <atomic>
 #include <chrono>
@@ -17,13 +27,14 @@
 #include <sstream>
 #include <thread>
 
-#pragma comment(lib, "winhttp.lib")
-#pragma comment(lib, "bcrypt.lib")
-
 namespace slippi::report {
 namespace {
 using json = nlohmann::json;
+#ifdef _MSC_VER
 const wchar_t* USER_AGENT = L"SlippiDolphin (b: ishiiruka) (v: 3.6.4) (o: windows)";
+#else
+const char* USER_AGENT = "SlippiDolphin (b: ishiiruka) (v: 3.6.4) (o: linux)";
+#endif
 const char* ENDPOINT = "https://internal.slippi.gg/graphql";
 constexpr int MAX_ATTEMPTS = 5;
 
@@ -39,11 +50,12 @@ std::string g_iso_path, g_cache_dir;
 std::atomic<bool> g_hash_done{false};
 std::string g_iso_hash;
 
-// ---- HTTP (WinHTTP)
+// ---- HTTP
+#ifdef _MSC_VER
 std::wstring widen(const std::string& s) { int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0); std::wstring w(n ? n - 1 : 0, 0); if (n) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n); return w; }
 
-bool http(const char* method, const std::string& url, const std::wstring& headers, const std::string& body, int* status, std::string* response) {
-  std::wstring wurl = widen(url);
+bool http(const char* method, const std::string& url, const std::string& headers, const std::string& body, int* status, std::string* response) {
+  std::wstring wurl = widen(url), wheaders = widen(headers), wmethod = widen(method);
   URL_COMPONENTS uc{}; uc.dwStructSize = sizeof uc;
   wchar_t host[256]{}, path[2048]{};
   uc.lpszHostName = host; uc.dwHostNameLength = 256; uc.lpszUrlPath = path; uc.dwUrlPathLength = 2048;
@@ -54,10 +66,9 @@ bool http(const char* method, const std::string& url, const std::wstring& header
   bool ok = false;
   HINTERNET conn = WinHttpConnect(session, host, uc.nPort, 0);
   if (conn) {
-    std::wstring wmethod = widen(method);
     HINTERNET req = WinHttpOpenRequest(conn, wmethod.c_str(), path, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
     if (req) {
-      if (WinHttpSendRequest(req, headers.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : headers.c_str(), headers.empty() ? 0 : (DWORD)-1,
+      if (WinHttpSendRequest(req, headers.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : wheaders.c_str(), headers.empty() ? 0 : (DWORD)-1,
                              body.empty() ? WINHTTP_NO_REQUEST_DATA : (LPVOID)body.data(), (DWORD)body.size(), (DWORD)body.size(), 0) &&
           WinHttpReceiveResponse(req, nullptr)) {
         DWORD code = 0, size = sizeof code;
@@ -81,12 +92,61 @@ bool http(const char* method, const std::string& url, const std::wstring& header
   WinHttpCloseHandle(session);
   return ok;
 }
+#else
+size_t curl_write(char* ptr, size_t size, size_t nmemb, void* userdata) {
+  static_cast<std::string*>(userdata)->append(ptr, size * nmemb);
+  return size * nmemb;
+}
+bool http(const char* method, const std::string& url, const std::string& headers, const std::string& body, int* status, std::string* response) {
+  static bool curl_ready = [] { curl_global_init(CURL_GLOBAL_DEFAULT); return true; }();
+  (void)curl_ready;
+  CURL* curl = curl_easy_init();
+  if (!curl) return false;
+  std::string out;
+  struct curl_slist* hdr = nullptr;
+  std::istringstream lines(headers);
+  std::string line;
+  while (std::getline(lines, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (!line.empty()) hdr = curl_slist_append(hdr, line.c_str());
+  }
+  curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+  curl_easy_setopt(curl, CURLOPT_USERAGENT, USER_AGENT);
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdr);
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out);
+  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
+  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+  if (std::strcmp(method, "POST") == 0) {
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.data());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body.size());
+  } else if (std::strcmp(method, "PUT") == 0) {
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.data());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body.size());
+  } else if (std::strcmp(method, "GET") != 0) {
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
+  }
+  CURLcode rc = curl_easy_perform(curl);
+  long code = 0;
+  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+  if (status) *status = (int)code;
+  bool ok = rc == CURLE_OK;
+  if (ok && response) *response = out;
+  if (hdr) curl_slist_free_all(hdr);
+  curl_easy_cleanup(curl);
+  return ok;
+}
+#endif
 
 // GraphQL POST; returns the `data` object or null (and logs) on failure.
 json graphql(const std::string& query, const json& variables) {
   json body = {{"query", query}, {"variables", variables}};
   int status = 0; std::string response;
-  if (!http("POST", ENDPOINT, L"Content-Type: application/json\r\n", body.dump(), &status, &response)) { host::log("slippi report: request failed (network)"); return nullptr; }
+  if (!http("POST", ENDPOINT, "Content-Type: application/json\r\n", body.dump(), &status, &response)) { host::log("slippi report: request failed (network)"); return nullptr; }
   json r = json::parse(response, nullptr, false);
   if (r.is_discarded()) { host::log("slippi report: bad response (HTTP %d): %s", status, response.substr(0, 200).c_str()); return nullptr; }
   if (r.count("errors") && r["errors"].is_array() && !r["errors"].empty()) { host::log("slippi report: server error: %s", r["errors"].dump().substr(0, 300).c_str()); return nullptr; }
@@ -122,7 +182,8 @@ std::string gzip_stored(const std::string& in) {
   return out;
 }
 
-// ---- ISO MD5 (BCrypt), cached by path, size and modification time.
+// ---- ISO MD5, cached by path, size and modification time.
+#ifdef _MSC_VER
 std::string md5_file(const std::string& path) {
   BCRYPT_ALG_HANDLE alg = nullptr; BCRYPT_HASH_HANDLE h = nullptr;
   if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_MD5_ALGORITHM, nullptr, 0) < 0) return "";
@@ -149,6 +210,32 @@ void hash_iso() {
     char buf[128]; std::snprintf(buf, sizeof buf, "|%llu|%llu", ((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow, ((unsigned long long)fa.ftLastWriteTime.dwHighDateTime << 32) | fa.ftLastWriteTime.dwLowDateTime);
     key = g_iso_path + buf;
   }
+#else
+std::string md5_file(const std::string& path) {
+  EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+  std::string result;
+  if (ctx && EVP_DigestInit_ex(ctx, EVP_md5(), nullptr) == 1) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (f) {
+      std::vector<uint8_t> buf(4 << 20);
+      size_t n;
+      while ((n = std::fread(buf.data(), 1, buf.size(), f)) > 0) EVP_DigestUpdate(ctx, buf.data(), n);
+      std::fclose(f);
+      unsigned char digest[EVP_MAX_MD_SIZE]; unsigned int dlen = 0;
+      if (EVP_DigestFinal_ex(ctx, digest, &dlen) == 1) { char hex[EVP_MAX_MD_SIZE * 2 + 1]; for (unsigned i = 0; i < dlen; ++i) std::snprintf(hex + 2 * i, 3, "%02x", digest[i]); result = hex; }
+    }
+  }
+  if (ctx) EVP_MD_CTX_free(ctx);
+  return result;
+}
+void hash_iso() {
+  std::string key;
+  struct stat st{};
+  if (stat(g_iso_path.c_str(), &st) == 0) {
+    char buf[128]; std::snprintf(buf, sizeof buf, "|%llu|%llu", (unsigned long long)st.st_size, (unsigned long long)st.st_mtime);
+    key = g_iso_path + buf;
+  }
+#endif
   std::string cache = g_cache_dir + "/iso_md5_cache.txt";
   { std::ifstream in(cache); std::string line; while (std::getline(in, line)) { size_t eq = line.rfind('='); if (eq != std::string::npos && line.substr(0, eq) == key) { g_iso_hash = line.substr(eq + 1); g_hash_done = true; return; } } }
   auto t0 = std::chrono::steady_clock::now();
@@ -172,7 +259,7 @@ void upload_replay(const std::string& path, const std::string& url) {
   if (contents.empty()) { host::log("slippi report: no replay to upload (%s)", path.c_str()); return; }
   std::string gz = gzip_stored(contents);
   int status = 0;
-  bool ok = http("PUT", url, L"Content-Type: application/octet-stream\r\nContent-Encoding: gzip\r\nX-Goog-Content-Length-Range: 0,10000000\r\n", gz, &status, nullptr);
+  bool ok = http("PUT", url, "Content-Type: application/octet-stream\r\nContent-Encoding: gzip\r\nX-Goog-Content-Length-Range: 0,10000000\r\n", gz, &status, nullptr);
   host::log("slippi report: replay upload %s (HTTP %d, %zu bytes)", ok && status / 100 == 2 ? "done" : "failed", status, gz.size());
 }
 
@@ -286,7 +373,7 @@ void fetch_user_rank(const std::string& uid) {
   g_rank_thread = std::thread([uid] {
     std::string url = "https://users-rest-dot-slippi.uc.r.appspot.com/user/" + uid + "?additionalFields=chatMessages,rank";
     int status = 0; std::string response;
-    if (!http("GET", url, L"", "", &status, &response)) { g_rank_status = RankFetchStatus::Error; host::log("slippi rank: user fetch failed (network)"); return; }
+    if (!http("GET", url, "", "", &status, &response)) { g_rank_status = RankFetchStatus::Error; host::log("slippi rank: user fetch failed (network)"); return; }
     json j = json::parse(response, nullptr, false);
     if (j.is_discarded() || !j.is_object() || !j.count("rank") || !j["rank"].is_object()) { g_rank_status = RankFetchStatus::Error; host::log("slippi rank: user fetch HTTP %d, no rank in response", status); return; }
     auto& r = j["rank"];

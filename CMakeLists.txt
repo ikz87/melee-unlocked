@@ -2,30 +2,45 @@ cmake_minimum_required(VERSION 3.15)
 project(MeleeUnlocked LANGUAGES CXX)
 enable_testing()
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
-set(HOST_FOBJ "${CMAKE_CURRENT_BINARY_DIR}/generated/FObjHost.cpp")
-add_custom_command(OUTPUT "${HOST_FOBJ}"
-  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_fobj_host.py" "${HOST_FOBJ}"
-  DEPENDS tools/generate_fobj_host.py melee/src/sysdolphin/baselib/fobj.c
-          melee/src/sysdolphin/baselib/fobj.h melee/src/sysdolphin/baselib/spline.c)
-add_library(native_animation STATIC "${HOST_FOBJ}")
-target_include_directories(native_animation PUBLIC native)
-target_compile_features(native_animation PUBLIC cxx_std_14)
-add_executable(native_asset_test tests/native_asset_test.cpp)
-add_executable(packed_animation_test tests/packed_animation_test.cpp)
-target_link_libraries(packed_animation_test PRIVATE native_animation)
-add_test(NAME packed_animation COMMAND packed_animation_test)
-target_link_libraries(native_asset_test PRIVATE native_animation)
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/runtime/native-assets/PlFcAJ.dat")
-  add_test(NAME native_assets COMMAND native_asset_test "${CMAKE_CURRENT_SOURCE_DIR}/runtime/native-assets")
+
+# The host-side FObj interpreter is generated from the pinned doldecomp/melee checkout. When that
+# checkout is absent (for example a Linux build that does not need authored sub-frame animation),
+# the port supplies a fallback sampler instead; see port/runtime/gx/fobj_host_stub.cpp.
+set(MELEE_DECOMP_AVAILABLE FALSE)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/melee/src/sysdolphin/baselib/fobj.c")
+  set(MELEE_DECOMP_AVAILABLE TRUE)
+  set(HOST_FOBJ "${CMAKE_CURRENT_BINARY_DIR}/generated/FObjHost.cpp")
+  add_custom_command(OUTPUT "${HOST_FOBJ}"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_fobj_host.py" "${HOST_FOBJ}"
+    DEPENDS tools/generate_fobj_host.py melee/src/sysdolphin/baselib/fobj.c
+            melee/src/sysdolphin/baselib/fobj.h melee/src/sysdolphin/baselib/spline.c)
+  add_library(native_animation STATIC "${HOST_FOBJ}")
+  target_include_directories(native_animation PUBLIC native)
+  target_compile_features(native_animation PUBLIC cxx_std_14)
+  add_executable(native_asset_test tests/native_asset_test.cpp)
+  add_executable(packed_animation_test tests/packed_animation_test.cpp)
+  target_link_libraries(packed_animation_test PRIVATE native_animation)
+  add_test(NAME packed_animation COMMAND packed_animation_test)
+  target_link_libraries(native_asset_test PRIVATE native_animation)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/runtime/native-assets/PlFcAJ.dat")
+    add_test(NAME native_assets COMMAND native_asset_test "${CMAKE_CURRENT_SOURCE_DIR}/runtime/native-assets")
+  endif()
+else()
+  add_library(native_animation STATIC "${CMAKE_CURRENT_SOURCE_DIR}/port/runtime/gx/fobj_host_stub.cpp")
+  target_include_directories(native_animation PUBLIC native)
+  target_compile_features(native_animation PUBLIC cxx_std_14)
 endif()
 
-option(MELEE_BUILD_EXPERIMENTAL_PORT "Build the incomplete native recompilation prototype" OFF)
+option(MELEE_BUILD_EXPERIMENTAL_PORT "Build the native recompilation port" OFF)
 if(MELEE_BUILD_EXPERIMENTAL_PORT)
-  if(NOT WIN32 OR NOT MSVC OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
-    message(FATAL_ERROR "The experimental port requires Windows x64 and MSVC")
+  if(WIN32)
+    if(NOT MSVC OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+      message(FATAL_ERROR "The experimental port requires Windows x64 and MSVC")
+    endif()
   endif()
   add_subdirectory(port)
 endif()
+
 add_executable(native_animation_test tests/native_animation_test.cpp)
 target_include_directories(native_animation_test PRIVATE native)
 target_compile_features(native_animation_test PRIVATE cxx_std_14)

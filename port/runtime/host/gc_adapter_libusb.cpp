@@ -1,32 +1,32 @@
-// Official / Mayflash "GameCube Controller Adapter for Wii U" over WinUSB (the driver Slippi's
-// setup installs with Zadig). Same protocol as Dolphin's GCAdapter: one 0x13 byte starts the
-// 37-byte report stream on endpoint 0x81 (status + 9 bytes per port), 0x11 + 4 bytes sets rumble.
+// Official / Mayflash "GameCube Controller Adapter for Wii U" over libusb (POSIX). Same protocol as
+// the Windows WinUSB path and Dolphin's GCAdapter: one 0x13 byte starts the 37-byte report stream
+// on endpoint 0x81 (status + 9 bytes per port), 0x11 + 4 bytes sets rumble. The adapter is not
+// exposed as a joystick by the kernel, so we detach any kernel driver and claim interface 0.
 // SPDX-License-Identifier: GPL-2.0-or-later
-#ifdef _MSC_VER
+#ifndef _MSC_VER
 #include "host.h"
-#define NOMINMAX
-#include <windows.h>
-#include <setupapi.h>
-#include <initguid.h>
-#include <usbiodef.h>
-#include <winusb.h>
+#include <libusb-1.0/libusb.h>
 #include <atomic>
 #include <chrono>
 #include <cstring>
 #include <mutex>
-#include <string>
 #include <thread>
 
 namespace host {
 namespace {
+
+constexpr uint16_t kVID = 0x057e, kPID = 0x0337;
+constexpr uint8_t kEpIn = 0x81, kEpOut = 0x02;
+constexpr int kTimeoutMs = 100;
 
 enum : uint16_t {
   PAD_LEFT = 0x0001, PAD_RIGHT = 0x0002, PAD_DOWN = 0x0004, PAD_UP = 0x0008, PAD_Z = 0x0010, PAD_R = 0x0020, PAD_L = 0x0040,
   PAD_A = 0x0100, PAD_B = 0x0200, PAD_X = 0x0400, PAD_Y = 0x0800, PAD_START = 0x1000,
 };
 
-HANDLE g_file = INVALID_HANDLE_VALUE;
-WINUSB_INTERFACE_HANDLE g_usb = nullptr;
+libusb_context* g_ctx = nullptr;
+libusb_device_handle* g_dev = nullptr;
+bool g_claimed = false;
 std::thread g_thread;
 std::atomic<bool> g_running{false};
 std::mutex g_mutex;
@@ -38,49 +38,25 @@ struct Origin { bool set = false; uint8_t sx = 128, sy = 128, cx = 128, cy = 128
 std::atomic<uint8_t> g_rumble[4]{};
 std::atomic<bool> g_rumble_dirty{false};
 
-std::string find_adapter_path() {
-  HDEVINFO devs = SetupDiGetClassDevsA(&GUID_DEVINTERFACE_USB_DEVICE, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
-  if (devs == INVALID_HANDLE_VALUE) return "";
-  std::string found;
-  SP_DEVICE_INTERFACE_DATA iface{}; iface.cbSize = sizeof iface;
-  for (DWORD i = 0; SetupDiEnumDeviceInterfaces(devs, nullptr, &GUID_DEVINTERFACE_USB_DEVICE, i, &iface); ++i) {
-    DWORD needed = 0;
-    SetupDiGetDeviceInterfaceDetailA(devs, &iface, nullptr, 0, &needed, nullptr);
-    if (!needed) continue;
-    std::string buf(needed, '\0');
-    auto* detail = (SP_DEVICE_INTERFACE_DETAIL_DATA_A*)buf.data();
-    detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A);
-    if (!SetupDiGetDeviceInterfaceDetailA(devs, &iface, detail, needed, nullptr, nullptr)) continue;
-    std::string path(detail->DevicePath);
-    std::string lower(path);
-    for (auto& c : lower) c = (char)tolower((unsigned char)c);
-    if (lower.find("vid_057e&pid_0337") != std::string::npos) { found = path; break; }
-  }
-  SetupDiDestroyDeviceInfoList(devs);
-  return found;
-}
-
 void reader_thread() {
-  ULONG timeout = 100;
-  WinUsb_SetPipePolicy(g_usb, 0x81, PIPE_TRANSFER_TIMEOUT, sizeof timeout, &timeout);
   uint8_t start = 0x13;
-  ULONG n = 0;
-  if (!WinUsb_WritePipe(g_usb, 0x02, &start, 1, &n, nullptr)) log("gc adapter: start command failed (%lu)", GetLastError());
+  int n = 0;
+  if (libusb_interrupt_transfer(g_dev, kEpOut, &start, 1, &n, kTimeoutMs) != 0)
+    log("gc adapter: start command failed");
   int failures = 0;
   while (g_running.load()) {
     uint8_t buf[37];
-    ULONG got = 0;
-    if (WinUsb_ReadPipe(g_usb, 0x81, buf, sizeof buf, &got, nullptr)) {
+    int got = 0;
+    int rc = libusb_interrupt_transfer(g_dev, kEpIn, buf, sizeof buf, &got, kTimeoutMs);
+    if (rc == 0) {
       failures = 0;
       if (got == 37 && buf[0] == 0x21) { std::lock_guard<std::mutex> lk(g_mutex); std::memcpy(g_report, buf, 37); g_have_report = true; }
-    } else {
-      DWORD err = GetLastError();
-      if (err == ERROR_SEM_TIMEOUT || err == WAIT_TIMEOUT) continue;
-      if (++failures > 20) { log("gc adapter: read failed (%lu), adapter disconnected", err); break; }
+    } else if (rc != LIBUSB_ERROR_TIMEOUT) {
+      if (++failures > 20) { log("gc adapter: read failed (%d), adapter disconnected", rc); break; }
     }
     if (g_rumble_dirty.exchange(false)) {
       uint8_t cmd[5] = {0x11, g_rumble[0], g_rumble[1], g_rumble[2], g_rumble[3]};
-      WinUsb_WritePipe(g_usb, 0x02, cmd, sizeof cmd, &n, nullptr);
+      libusb_interrupt_transfer(g_dev, kEpOut, cmd, sizeof cmd, &n, kTimeoutMs);
     }
   }
   g_running.store(false);
@@ -89,31 +65,56 @@ void reader_thread() {
 void close_adapter() {
   g_running.store(false);
   if (g_thread.joinable()) g_thread.join();
-  if (g_usb) { WinUsb_Free(g_usb); g_usb = nullptr; }
-  if (g_file != INVALID_HANDLE_VALUE) { CloseHandle(g_file); g_file = INVALID_HANDLE_VALUE; }
+  if (g_dev) {
+    if (g_claimed) libusb_release_interface(g_dev, 0);
+    libusb_attach_kernel_driver(g_dev, 0);   // ignore error: nothing was attached
+    libusb_close(g_dev);
+    g_dev = nullptr;
+  }
+  g_claimed = false;
   std::lock_guard<std::mutex> lk(g_mutex);
   g_have_report = false;
   for (auto& o : g_origin) o.set = false;
 }
 
 bool open_adapter() {
-  std::string path = find_adapter_path();
-  if (path.empty()) {
-    if (!g_logged_missing) { log("gc adapter: no WUP-028 adapter found (VID 057E PID 0337 with the WinUSB driver); keyboard/XInput stay active"); g_logged_missing = true; }
+  if (!g_ctx && libusb_init(&g_ctx) != 0) { log("gc adapter: libusb_init failed"); g_ctx = nullptr; return false; }
+  libusb_device** list = nullptr;
+  ssize_t count = libusb_get_device_list(g_ctx, &list);
+  libusb_device* found = nullptr;
+  for (ssize_t i = 0; i < count && !found; ++i) {
+    libusb_device_descriptor desc{};
+    if (libusb_get_device_descriptor(list[i], &desc) != 0) continue;
+    if (desc.idVendor == kVID && desc.idProduct == kPID) found = list[i];
+  }
+  if (!found) {
+    if (list) libusb_free_device_list(list, 1);
+    if (!g_logged_missing) { log("gc adapter: no WUP-028 adapter found (VID 057E PID 0337); keyboard/gamepad stay active"); g_logged_missing = true; }
     return false;
   }
-  g_file = CreateFileA(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
-                       FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, nullptr);
-  if (g_file == INVALID_HANDLE_VALUE) {
-    if (!g_logged_missing) { log("gc adapter: found but cannot open (%lu): another program (Dolphin?) may hold it, or the driver is not WinUSB", GetLastError()); g_logged_missing = true; }
+  int rc = libusb_open(found, &g_dev);
+  libusb_free_device_list(list, 1);
+  if (rc != 0) {
+    if (!g_logged_missing) { log("gc adapter: found but cannot open (%s): check the udev rule/permissions", libusb_strerror((libusb_error)rc)); g_logged_missing = true; }
+    g_dev = nullptr;
     return false;
   }
-  if (!WinUsb_Initialize(g_file, &g_usb)) {
-    if (!g_logged_missing) { log("gc adapter: WinUsb_Initialize failed (%lu): install the WinUSB driver with Zadig as for Slippi", GetLastError()); g_logged_missing = true; }
-    CloseHandle(g_file); g_file = INVALID_HANDLE_VALUE;
+  // Ask libusb to restore the kernel driver when the handle is released.
+  libusb_set_auto_detach_kernel_driver(g_dev, 1);
+  // The kernel's usbhid usually claims interface 0; detach it so we can speak the raw protocol.
+  if (libusb_kernel_driver_active(g_dev, 0) == 1) libusb_detach_kernel_driver(g_dev, 0);
+  rc = libusb_claim_interface(g_dev, 0);
+  if (rc != 0) {
+    if (!g_logged_missing) {
+      log("gc adapter: cannot claim interface (%s): another program may hold it (Dolphin?); retrying every 2 s",
+          libusb_strerror((libusb_error)rc));
+      g_logged_missing = true;
+    }
+    libusb_close(g_dev); g_dev = nullptr;
     return false;
   }
-  log("gc adapter: opened %s", path.c_str());
+  g_claimed = true;
+  log("gc adapter: opened WUP-028 over libusb");
   g_logged_missing = false;
   g_running.store(true);
   g_thread = std::thread(reader_thread);
@@ -125,8 +126,8 @@ bool open_adapter() {
 // Fills ports that have a controller plugged into the adapter; returns the mask of those ports.
 uint32_t gcadapter_poll(PadState out[4]) {
   auto now = std::chrono::steady_clock::now();
-  if (!g_usb || !g_running.load()) {
-    if (g_usb && !g_running.load()) close_adapter();
+  if (!g_dev || !g_running.load()) {
+    if (g_dev && !g_running.load()) close_adapter();
     if (now < g_next_scan) return 0;
     g_next_scan = now + std::chrono::seconds(2);
     if (!open_adapter()) return 0;
@@ -168,8 +169,11 @@ void gcadapter_rumble(int port, bool on) {
   if (g_rumble[port] != v) { g_rumble[port] = v; g_rumble_dirty = true; }
 }
 
-void gcadapter_shutdown() { close_adapter(); }
+void gcadapter_shutdown() {
+  close_adapter();
+  if (g_ctx) { libusb_exit(g_ctx); g_ctx = nullptr; }
+}
 
 }  // namespace host
 
-#endif  // _MSC_VER
+#endif  // !_MSC_VER

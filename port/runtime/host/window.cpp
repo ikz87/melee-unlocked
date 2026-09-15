@@ -1,11 +1,13 @@
 // Win32 window, message pump, keyboard + XInput controller mapping to GameCube pads.
 // SPDX-License-Identifier: GPL-2.0-or-later
+#ifdef _MSC_VER
 #define NOMINMAX
 #include <windows.h>
 #include <xinput.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 #include <mutex>
 #include <atomic>
@@ -54,7 +56,15 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 }  // namespace
 
-void* window_create(int w, int h, const wchar_t* title, bool visible) {
+static std::wstring widen_title(const char* s) {
+  if (!s) return {};
+  int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, nullptr, 0);
+  std::wstring w(n ? n - 1 : 0, 0);
+  if (n) MultiByteToWideChar(CP_UTF8, 0, s, -1, w.data(), n);
+  return w;
+}
+
+void* window_create(int w, int h, const char* title, bool visible) {
   HINSTANCE inst = GetModuleHandleW(nullptr);
   WNDCLASSW wc{};
   wc.hInstance = inst; wc.lpfnWndProc = wnd_proc; wc.lpszClassName = L"MeleePortWindow"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
@@ -62,7 +72,8 @@ void* window_create(int w, int h, const wchar_t* title, bool visible) {
   RegisterClassW(&wc);
   RECT r{0, 0, w, h};
   AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-  g_hwnd = CreateWindowExW(0, wc.lpszClassName, title, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
+  std::wstring wtitle = widen_title(title);
+  g_hwnd = CreateWindowExW(0, wc.lpszClassName, wtitle.c_str(), WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
                            r.right - r.left, r.bottom - r.top, nullptr, nullptr, inst, nullptr);
   if (!g_hwnd) die("cannot create native window");
   g_closed = false;
@@ -138,6 +149,7 @@ void window_pump() {
   }
 }
 
+void window_set_title(const char* title) { if (g_hwnd) { std::wstring w = widen_title(title); SetWindowTextW(g_hwnd, w.c_str()); } }
 void window_set_title(const wchar_t* title) { if (g_hwnd) SetWindowTextW(g_hwnd, title); }
 bool window_closed() { return g_closed; }
 void window_client_size(int* w, int* h) { *w = g_client_w; *h = g_client_h; }
@@ -264,3 +276,5 @@ void input_poll(PadState out[4]) {
 }
 
 }  // namespace host
+
+#endif  // _MSC_VER

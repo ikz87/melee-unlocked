@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#ifdef _MSC_VER
 #include "updater.h"
 #include "host.h"
 #define NOMINMAX
@@ -159,3 +160,5 @@ void download_and_install() {
   });
 }
 }  // namespace host::updater
+
+#endif  // _MSC_VER
